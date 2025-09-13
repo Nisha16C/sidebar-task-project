@@ -1,0 +1,263 @@
+
+i want to create a attractive and beautifull UI using given apis  as i give you previous UI reference , 
+
+
+use given apis and provide professional UI  
+
+
+
+
+from fastapi import FastAPI, HTTPException
+from kubernetes import client, config
+from pydantic import BaseModel
+from typing import Dict, List, Union, Optional, Any
+from langchain_openai import ChatOpenAI
+from langchain.prompts import PromptTemplate
+from langchain.chains import LLMChain
+from fastapi.concurrency import run_in_threadpool
+import json, re
+import os
+from dotenv import load_dotenv
+
+# -------------------------------------------------
+# Load environment variables from .env file
+# -------------------------------------------------
+load_dotenv()
+# -------------------------------------------------
+# Load Kubernetes configuration
+# -------------------------------------------------
+try:
+    # Try loading from the default location (~/.kube/config)
+    config.load_kube_config()
+except config.ConfigException:
+    try:
+        # Try loading from within a Kubernetes cluster
+        config.load_incluster_config()
+    except config.ConfigException:
+        raise RuntimeError("Could not load Kubernetes configuration. Ensure you have a valid kubeconfig file or are running inside a cluster.")
+
+# -------------------------------------------------
+# FastAPI app
+# -------------------------------------------------
+app = FastAPI(
+    title="Kubernetes Node Label Explorer API",
+    description="Explore Kubernetes Node Feature Discovery labels and details with AI insights.",
+    version="1.0.0",
+)
+
+# -------------------------------------------------
+# Pydantic models
+# -------------------------------------------------
+class NodeLabels(BaseModel):
+    node_name: str
+    labels: Dict[str, str]
+    insights: Optional[Dict[str, str]] = None
+
+class AllNodeLabels(BaseModel):
+    nodes: List[NodeLabels]
+
+# --- NEW: Pydantic models for Node Details ---
+class NodeDetails(BaseModel):
+    node_name: str
+    details: Dict[str, Any]
+
+class AllNodeDetails(BaseModel):
+    nodes: List[NodeDetails]
+
+# -------------------------------------------------
+# LLM Setup (Groq)
+# -------------------------------------------------
+llm = ChatOpenAI(
+    # It's recommended to load the API key from an environment variable for security
+    api_key=os.getenv("OPENAI_API_KEY"),  
+    model="llama-3.1-8b-instant",
+    base_url="https://api.groq.com/openai/v1"
+)
+
+# --- CORRECTED PROMPT ---
+# This prompt is more specific and includes an example to guide the AI.
+prompt = PromptTemplate(
+    input_variables=["node_name", "labels"],
+    template="""
+You are a Kubernetes expert. Your task is to analyze the labels of a node and provide a simple, one-sentence explanation for each.
+
+Node Name: '{node_name}'
+Labels:
+{labels}
+
+For each label, provide a concise, one-sentence description of its meaning.
+The output MUST be a single, valid JSON object. The keys must be the original label names and the values must be their one-sentence explanations.
+
+EXAMPLE:
+If the labels are {{"beta.kubernetes.io/instance-type": "k3s"}}, the output should be:
+{{
+  "beta.kubernetes.io/instance-type": "Indicates the instance type is 'k3s', a lightweight Kubernetes distribution."
+}}
+
+Do not include any introductory text, explanations, or markdown formatting like ```json outside of the JSON object itself.
+"""
+)
+
+chain = LLMChain(llm=llm, prompt=prompt)
+
+# -------------------------------------------------
+# Helper: Generate AI insights
+# -------------------------------------------------
+async def generate_insights(node_name: str, labels: Dict[str, str]) -> Dict[str, str]:
+    """Generates AI-powered explanations for Kubernetes node labels."""
+    if not labels:
+        return {} # Return empty insights if there are no labels
+    try:
+        # Run the LLM chain in a separate thread to avoid blocking the event loop
+        raw_response = await run_in_threadpool(chain.invoke, {"node_name": node_name, "labels": json.dumps(labels, indent=2)})
+        
+        # Extract the text content from the response object
+        text_content = raw_response.get("text", "").strip()
+
+        # Debug: print raw LLM response in the terminal
+        print("\n===== RAW LLM RESPONSE =====")
+        print(text_content)
+        print("===========================\n")
+
+        # Attempt to parse the text directly as JSON
+        try:
+            parsed_json = json.loads(text_content)
+        except json.JSONDecodeError:
+            # If direct parsing fails, use regex to find a JSON object within the text
+            # This handles cases where the LLM might add extra text before or after the JSON
+            match = re.search(r"\{.*\}", text_content, re.DOTALL)
+            if not match:
+                raise ValueError(f"No valid JSON object found in the LLM response: {text_content}")
+            parsed_json = json.loads(match.group(0))
+
+        # Ensure all values in the final dictionary are strings
+        return {str(k): str(v) for k, v in parsed_json.items()}
+
+    except Exception as e:
+        # Log the error for debugging purposes
+        print(f"Error generating insights for node '{node_name}': {e}")
+        return {"error": f"Could not generate insights: {str(e)}"}
+
+# -------------------------------------------------
+# Core Functions
+# -------------------------------------------------
+def get_all_node_labels() -> Dict[str, Dict[str, str]]:
+    """Retrieves labels for all nodes in the cluster."""
+    v1 = client.CoreV1Api()
+    nodes = v1.list_node().items
+    return {node.metadata.name: node.metadata.labels or {} for node in nodes}
+
+def get_node_labels(node_name: str) -> Optional[Dict[str, str]]:
+    """Retrieves labels for a specific node by name."""
+    v1 = client.CoreV1Api()
+    try:
+        node = v1.read_node(name=node_name)
+        return node.metadata.labels or {}
+    except client.ApiException as e:
+        if e.status == 404:
+            return None
+        raise # Reraise other API errors
+
+async def get_all_node_labels_with_insights() -> List[Dict]:
+    """Retrieves labels and generates AI insights for all nodes."""
+    all_labels = get_all_node_labels()
+    nodes_data = []
+    for name, labels in all_labels.items():
+        insights = await generate_insights(name, labels)
+        nodes_data.append({"node_name": name, "labels": labels, "insights": insights})
+    return nodes_data
+
+async def get_node_labels_with_insights(node_name: str) -> Optional[Dict]:
+    """Retrieves labels and generates AI insights for a specific node."""
+    labels = get_node_labels(node_name)
+    if labels is None:
+        return None
+    insights = await generate_insights(node_name, labels)
+    return {"node_name": node_name, "labels": labels, "insights": insights}
+
+# --- NEW: Core functions for Node Details ---
+def _extract_node_details(node: Any) -> Dict[str, Any]:
+    """Helper function to parse a V1Node object into a simple dictionary."""
+    details = {
+        "creationTimestamp": node.metadata.creation_timestamp.isoformat() if node.metadata.creation_timestamp else None,
+        "addresses": {addr.type: addr.address for addr in node.status.addresses},
+        "nodeInfo": {
+            "osImage": node.status.node_info.os_image,
+            "kernelVersion": node.status.node_info.kernel_version,
+            "kubeletVersion": node.status.node_info.kubelet_version,
+            "containerRuntimeVersion": node.status.node_info.container_runtime_version,
+        },
+        "capacity": {
+            "cpu": node.status.capacity.get("cpu"),
+            "memory": node.status.capacity.get("memory"),
+            "pods": node.status.capacity.get("pods"),
+        },
+        "conditions": {cond.type: cond.status for cond in node.status.conditions},
+    }
+    return details
+
+def get_all_node_details() -> List[Dict]:
+    """Retrieves key details for all nodes in the cluster."""
+    v1 = client.CoreV1Api()
+    nodes = v1.list_node().items
+    return [{"node_name": n.metadata.name, "details": _extract_node_details(n)} for n in nodes]
+
+def get_node_details(node_name: str) -> Optional[Dict]:
+    """Retrieves key details for a specific node by name."""
+    v1 = client.CoreV1Api()
+    try:
+        node = v1.read_node(name=node_name)
+        return {"node_name": node_name, "details": _extract_node_details(node)}
+    except client.ApiException as e:
+        if e.status == 404:
+            return None
+        raise
+
+# -------------------------------------------------
+# API Endpoints
+# -------------------------------------------------
+@app.get("/labels", response_model=Union[NodeLabels, AllNodeLabels], tags=["Labels & Insights"])
+async def api_get_labels(node: Optional[str] = None):
+    """
+    Get raw labels for all nodes or for a single specified node.
+    - **node** (optional): The name of a specific node.
+    """
+    if node:
+        labels = get_node_labels(node)
+        if labels is None:
+            raise HTTPException(status_code=404, detail=f"Node '{node}' not found.")
+        return NodeLabels(node_name=node, labels=labels)
+    else:
+        all_labels = get_all_node_labels()
+        return AllNodeLabels(nodes=[NodeLabels(node_name=name, labels=labels) for name, labels in all_labels.items()])
+
+@app.get("/labels/insights", response_model=Union[NodeLabels, AllNodeLabels], tags=["Labels & Insights"])
+async def api_get_labels_with_insights(node: Optional[str] = None):
+    """
+    Get labels and AI-generated insights for all nodes or a single node.
+    - **node** (optional): The name of a specific node.
+    """
+    if node:
+        data = await get_node_labels_with_insights(node)
+        if data is None:
+            raise HTTPException(status_code=404, detail=f"Node '{node}' not found.")
+        return NodeLabels(**data)
+    else:
+        all_data = await get_all_node_labels_with_insights()
+        return AllNodeLabels(nodes=[NodeLabels(**data) for data in all_data])
+
+# --- NEW: Endpoint for Node Details ---
+@app.get("/details", response_model=Union[NodeDetails, AllNodeDetails], tags=["Node Details"])
+async def api_get_details(node: Optional[str] = None):
+    """
+    Get key details (IP, OS, capacity, status) for all or a single node.
+    - **node** (optional): The name of a specific node.
+    """
+    if node:
+        data = get_node_details(node)
+        if data is None:
+            raise HTTPException(status_code=404, detail=f"Node '{node}' not found.")
+        return NodeDetails(**data)
+    else:
+        all_data = get_all_node_details()
+        return AllNodeDetails(nodes=[NodeDetails(**data) for data in all_data])
